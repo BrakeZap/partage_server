@@ -22,6 +22,7 @@ async fn root() -> &'static str {
 struct RequestData {
     id: String,
     file: Vec<u8>,
+    hash: Vec<u8>,
 }
 
 #[derive(Serialize)]
