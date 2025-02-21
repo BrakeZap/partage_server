@@ -4,15 +4,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use moka::sync::Cache;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    let files = Arc::new(Mutex::new(HashMap::new()));
+    let files = Cache::builder()
+        .time_to_live(Duration::from_secs(60 * 60))
+        .build();
 
     let app = Router::new()
         .route("/", get(root))
@@ -35,7 +36,7 @@ struct RequestData {
     file_name: String,
     hash: Vec<u8>,
 }
-
+#[derive(Clone)]
 struct MemFile {
     file: Vec<u8>,
     file_name: String,
@@ -43,7 +44,7 @@ struct MemFile {
 }
 
 async fn handle_post(
-    State(state): State<Arc<Mutex<HashMap<String, MemFile>>>>,
+    State(state): State<Cache<String, MemFile>>,
 
     Json(payload): Json<RequestData>,
 ) -> axum::http::StatusCode {
@@ -53,8 +54,7 @@ async fn handle_post(
 
     println!("length of hash: {}", payload.hash.len());
 
-    let mut map = state.lock().await;
-    map.insert(
+    state.insert(
         payload.id,
         MemFile {
             file_name: payload.file_name,
@@ -66,16 +66,14 @@ async fn handle_post(
 }
 
 async fn handle_download(
-    State(state): State<Arc<Mutex<HashMap<String, MemFile>>>>,
+    State(state): State<Cache<String, MemFile>>,
     axum::extract::Path(file_id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let map = state.lock().await;
-
-    if !map.contains_key(&file_id) {
+    if !state.contains_key(&file_id) {
         return Json(json!(""));
     }
 
-    let file_info = map.get(&file_id).unwrap();
+    let file_info = state.get(&file_id).unwrap();
 
     let json =
         json!({"file_name": file_info.file_name, "file": file_info.file, "hash": file_info.hash});
