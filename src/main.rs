@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -18,6 +18,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/create", post(handle_post))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 200))
         .route("/download/{id}", get(handle_download))
         .with_state(files);
     let addr = "0.0.0.0:3030";
