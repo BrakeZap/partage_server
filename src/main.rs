@@ -1,20 +1,16 @@
 use axum::{
-    extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    body::Body,
+    extract::{Path, State},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
 use moka::sync::Cache;
-use serde::Deserialize;
 use serde_json::json;
-use std::{collections::HashMap, panic::UnwindSafe, process::Termination, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 #[tokio::main]
 async fn main() {
-    //let files: moka::sync::Cache<String, MemFile> = Cache::builder()
-    //    .time_to_live(Duration::from_secs(60 * 60))
-    //    .build();
-
     let s_state = ServerState {
         uploaded_files: Cache::builder()
             .time_to_live(Duration::from_secs(60 * 60))
@@ -25,8 +21,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/create", post(handle_post))
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 200))
-        .route("/download/{id}", get(handle_download))
+        .route("/download/{id}", get(handle_file_req))
+        .route("/download/{id}/{left}/{right}", get(handle_range_req))
         .with_state(s_state);
     let addr = "0.0.0.0:3030";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -41,13 +37,6 @@ struct ServerState {
 
 async fn root() -> &'static str {
     "Hi from the partage server!"
-}
-#[derive(Deserialize)]
-struct RequestData {
-    id: String,
-    file: Vec<u8>,
-    file_name: String,
-    hash: Vec<u8>,
 }
 #[derive(Clone)]
 struct MemFile {
@@ -159,25 +148,57 @@ async fn handle_post(State(state): State<ServerState>, mut multipart: axum::extr
     }
 }
 
-async fn handle_download(
-    State(state): State<ServerState>,
-    axum::extract::Path(file_id): axum::extract::Path<String>,
-) -> Json<serde_json::Value> {
-    if !state.uploaded_files.contains_key(&file_id) {
-        return Json(json!(""));
-    }
-
-    let file_info = state.uploaded_files.get(&file_id).unwrap();
-
-    let json =
-        json!({"file_name": file_info.file_name, "file": file_info.file, "hash": file_info.hash});
-
-    Json(json)
-}
-//
 //async fn handle_download(
 //    State(state): State<ServerState>,
 //    axum::extract::Path(file_id): axum::extract::Path<String>,
-//) {
-//    todo!()
+//) -> Json<serde_json::Value> {
+//    if !state.uploaded_files.contains_key(&file_id) {
+//        return Json(json!(""));
+//    }
+//
+//    let file_info = state.uploaded_files.get(&file_id).unwrap();
+//
+//    let json =
+//        json!({"file_name": file_info.file_name, "file": file_info.file, "hash": file_info.hash});
+//
+//    Json(json)
 //}
+//
+//
+async fn handle_file_req(
+    State(state): State<ServerState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    if !state.uploaded_files.contains_key(&id) {
+        return Json(json!(""));
+    }
+    let file_info = state.uploaded_files.get(&id).unwrap();
+
+    let json =
+        json!({"file_name": file_info.file_name, "file_size": file_info.file.len().to_string()});
+
+    Json(json)
+}
+
+async fn handle_range_req(
+    State(state): State<ServerState>,
+    Path((id, left, right)): Path<(String, usize, usize)>,
+) -> Response<Body> {
+    if !state.uploaded_files.contains_key(&id) {
+        return Response::builder()
+            .status(403)
+            .body(Body::from(()))
+            .unwrap();
+    }
+
+    let file_info = state.uploaded_files.get(&id).unwrap();
+
+    let buf: &[u8];
+
+    if right >= file_info.file.len() {
+        buf = &file_info.file[left..];
+    } else {
+        buf = &file_info.file[left..right];
+    }
+    Response::builder().body(Body::from(buf.to_vec())).unwrap()
+}
