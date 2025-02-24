@@ -5,24 +5,43 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use moka::sync::Cache;
 use serde_json::json;
-use std::{collections::HashMap, time::Duration};
+use sqlx::{prelude::FromRow, SqlitePool};
+use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() {
-    let s_state = ServerState {
-        uploaded_files: Cache::builder()
-            .time_to_live(Duration::from_secs(60 * 60))
-            .build(),
-        temp_files: Cache::builder().build(),
+    let conn_res = SqlitePool::connect("sqlite::memory:").await;
+
+    let conn = match conn_res {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Error opening a new database: {}", e);
+            return;
+        }
     };
+
+    let table_create = sqlx::query(
+        "CREATE TABLE files (id TEXT, chunk_num INT, hash BLOB, data MEDIUMBLOB, file_name TEXT, total_chunks INT)",
+    )
+    .execute(&conn)
+    .await;
+
+    match table_create {
+        Ok(_) => println!("Created tables, OK"),
+        Err(e) => {
+            println!("Error creating tables {}", e);
+            return;
+        }
+    };
+
+    let s_state = ServerState { conn };
 
     let app = Router::new()
         .route("/", get(root))
         .route("/create", post(handle_post))
         .route("/download/{id}", get(handle_file_req))
-        .route("/download/{id}/{left}/{right}", get(handle_range_req))
+        .route("/download/{id}/{chunk_num}", get(handle_range_req))
         .with_state(s_state);
     let addr = "0.0.0.0:3030";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -31,41 +50,12 @@ async fn main() {
 }
 #[derive(Clone)]
 struct ServerState {
-    uploaded_files: Cache<String, MemFile>,
-    temp_files: Cache<String, Vec<Vec<u8>>>,
+    conn: SqlitePool,
 }
 
 async fn root() -> &'static str {
     "Hi from the partage server!"
 }
-#[derive(Clone)]
-struct MemFile {
-    file: Vec<u8>,
-    file_name: String,
-    hash: Vec<u8>,
-}
-
-//async fn handle_post(
-//    State(state): State<Cache<String, MemFile>>,
-//
-//    Json(payload): Json<RequestData>,
-//) -> axum::http::StatusCode {
-//    println!("received post with id: {}\n", payload.id);
-//
-//    println!("length of file: {}", payload.file.len());
-//
-//    println!("length of hash: {}", payload.hash.len());
-//
-//    state.insert(
-//        payload.id,
-//        MemFile {
-//            file_name: payload.file_name,
-//            file: payload.file,
-//            hash: payload.hash,
-//        },
-//    );
-//    StatusCode::OK
-//}
 
 async fn handle_post(State(state): State<ServerState>, mut multipart: axum::extract::Multipart) {
     let mut text_map: HashMap<&str, String> = HashMap::new();
@@ -102,103 +92,71 @@ async fn handle_post(State(state): State<ServerState>, mut multipart: axum::extr
         }
     }
 
-    println!("text map {:?}", text_map);
-
-    //println!("byte map {:?}", byte_map);
-
     let id = text_map.get("id").unwrap();
+    let file_name = text_map.get("file_name").unwrap();
 
-    if state.temp_files.contains_key(id) {
-        let mut new_vec = state.temp_files.get(id).unwrap();
-        new_vec.push(byte_map.get("file").unwrap().to_vec());
-        state.temp_files.insert(id.to_string(), new_vec);
-    } else {
-        let mut temp_vec: Vec<Vec<u8>> = Vec::new();
-        temp_vec.push(byte_map.get("file").unwrap().to_vec());
-        state.temp_files.insert(id.to_string(), temp_vec);
-    }
+    let hash = byte_map.get("hash").unwrap();
+    let data = byte_map.get("file").unwrap();
+    let chunk_num = text_map.get("chunk_num").unwrap().parse::<i32>().unwrap();
+    let total_chunks = text_map
+        .get("total_chunks")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
 
-    if text_map.get("chunk_num").unwrap().parse::<usize>().unwrap()
-        == text_map
-            .get("total_chunks")
-            .unwrap()
-            .parse::<usize>()
-            .unwrap()
-            - 1
-    {
-        let mut final_file: Vec<u8> = Vec::new();
-        let temp = state.temp_files.get(id).unwrap();
-        println!("Length of temp files: {}", temp.len());
-        for i in 0..temp.len() {
-            let curr = temp.get(i).unwrap();
-            for j in 0..curr.len() {
-                final_file.push(*curr.get(j).unwrap());
-            }
-        }
+    let insert = sqlx::query("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(id)
+        .bind(chunk_num)
+        .bind(hash)
+        .bind(data)
+        .bind(file_name)
+        .bind(total_chunks)
+        .execute(&state.conn)
+        .await;
 
-        println!("Id: {} has total length of: {}", id, final_file.len());
-        state.uploaded_files.insert(
-            id.to_string(),
-            MemFile {
-                file_name: text_map.get("file_name").unwrap().to_string(),
-                hash: byte_map.get("hash").unwrap().to_vec(),
-                file: final_file,
-            },
-        );
+    match insert {
+        Ok(_) => (),
+        Err(e) => println!("Error updating database: {}", e),
     }
 }
 
-//async fn handle_download(
-//    State(state): State<ServerState>,
-//    axum::extract::Path(file_id): axum::extract::Path<String>,
-//) -> Json<serde_json::Value> {
-//    if !state.uploaded_files.contains_key(&file_id) {
-//        return Json(json!(""));
-//    }
-//
-//    let file_info = state.uploaded_files.get(&file_id).unwrap();
-//
-//    let json =
-//        json!({"file_name": file_info.file_name, "file": file_info.file, "hash": file_info.hash});
-//
-//    Json(json)
-//}
-//
-//
+#[derive(FromRow, Debug)]
+struct FileData {
+    id: String,
+    chunk_num: i32,
+    hash: Vec<u8>,
+    data: Vec<u8>,
+    file_name: String,
+    total_chunks: i32,
+}
 async fn handle_file_req(
     State(state): State<ServerState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    if !state.uploaded_files.contains_key(&id) {
-        return Json(json!(""));
+    let rows = sqlx::query_as::<_, FileData>("SELECT * FROM FILES where id = ?")
+        .bind(&id)
+        .fetch_optional(&state.conn)
+        .await
+        .unwrap();
+    match rows {
+        Some(r) => Json(json!({"file_name": r.file_name, "total_chunks": r.total_chunks})),
+        None => Json(json!("")),
     }
-    let file_info = state.uploaded_files.get(&id).unwrap();
-
-    let json =
-        json!({"file_name": file_info.file_name, "file_size": file_info.file.len().to_string()});
-
-    Json(json)
 }
 
 async fn handle_range_req(
     State(state): State<ServerState>,
-    Path((id, left, right)): Path<(String, usize, usize)>,
+    Path((id, chunk_num)): Path<(String, i32)>,
 ) -> Response<Body> {
-    if !state.uploaded_files.contains_key(&id) {
-        return Response::builder()
-            .status(403)
-            .body(Body::from(()))
-            .unwrap();
+    let rows = sqlx::query_as::<_, FileData>("SELECT * FROM files where id = ? AND chunk_num = ?")
+        .bind(&id)
+        .bind(chunk_num)
+        .fetch_optional(&state.conn)
+        .await
+        .unwrap();
+
+    match rows {
+        Some(r) => Response::builder().body(Body::from(r.data)).unwrap(),
+        None => Response::builder().body(Body::from(())).unwrap(),
     }
-
-    let file_info = state.uploaded_files.get(&id).unwrap();
-
-    let buf: &[u8];
-
-    if right >= file_info.file.len() {
-        buf = &file_info.file[left..];
-    } else {
-        buf = &file_info.file[left..right];
-    }
-    Response::builder().body(Body::from(buf.to_vec())).unwrap()
 }
